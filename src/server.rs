@@ -145,14 +145,18 @@ impl Server {
 
         let mut peers = Vec::new();
 
-        if let Ok(entire_dir) = std::fs::read_dir("/tmp") {
+        let parent_dir = std::path::Path::new(&self.unix_socket_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/tmp"));
+
+        if let Ok(entire_dir) = std::fs::read_dir(parent_dir) {
             for entry in entire_dir.flatten() {
                 if let Some(name) = entry.file_name().to_str()
                     && name.starts_with(&pattern)
                     && name.ends_with(".sock")
                     && name != my_socket
                 {
-                    peers.push(format!("/tmp/{}", name));
+                    peers.push(entry.path().to_string_lossy().to_string());
                 }
             }
         }
@@ -231,6 +235,8 @@ impl Server {
 
         println!("[Server {}] Handing off {} connection(s)", self.id, count);
 
+        println!("{peers:#?}");
+
         let mut peer_idx = 0;
         let mut handed_off = Vec::new();
 
@@ -238,6 +244,7 @@ impl Server {
             if let Ok(peer_addr) = stream.peer_addr() {
                 let fd = stream.as_raw_fd();
                 let target = &peers[peer_idx % peers.len()];
+                println!("{peers:#?}");
 
                 println!(
                     "[Server {}] Conn {} (FD={}, peer={}) → {}",
@@ -458,5 +465,20 @@ impl Server {
 
         println!("[Server {}] Cancelling all handlers", self.id);
         self.shutdown_token.cancel();
+    }
+}
+
+impl Drop for Server {
+    /// Automatically remove the unix socket when the server goes out of scope
+    fn drop(&mut self) {
+        println!(
+            "[Server {}] Attempting to clean up Unix socket {}",
+            self.id, self.unix_socket_path
+        );
+        if let Err(e) = std::fs::remove_file(&self.unix_socket_path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("[Server {}] Failed to remove socket: {}", self.id, e);
+        }
     }
 }
