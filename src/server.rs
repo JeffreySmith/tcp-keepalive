@@ -83,7 +83,7 @@ impl Server {
                     match result {
                         Ok((tcp_stream, _)) => {
                             println!("[Server {}] New client connection from {:?}", self.id, tcp_stream.peer_addr());
-                            let id = self.id.clone();
+                            let id = self.id;
                             let connections = Arc::clone(&self.active_connections);
                             let shutdown_token = self.shutdown_token.child_token();
 
@@ -262,7 +262,7 @@ impl Server {
         }
 
         println!(
-            "[Server {}] 🗑️  Forgetting {} stream(s)",
+            "[Server {}] Forgetting {} stream(s)",
             self.id,
             handed_off.len()
         );
@@ -270,7 +270,7 @@ impl Server {
             if let Some(stream) = connections.remove(&conn_id) {
                 let fd = stream.as_raw_fd();
                 println!(
-                    "[Server {}] 🔓 Forgetting FD {} (conn {})",
+                    "[Server {}] Forgetting FD {} (conn {})",
                     self.id, fd, conn_id
                 );
                 std::mem::forget(stream);
@@ -401,7 +401,7 @@ impl Server {
                             match Self::receive_tcp_connection(unix_stream).await {
                                 Ok(tcp_stream) => {
                                     println!("[Server {}] Hand-off successful!", self.id);
-                                    let id = self.id.clone();
+                                    let id = self.id;
                                     let connections = Arc::clone(&self.active_connections);
                                     let shutdown_token = self.shutdown_token.child_token();
 
