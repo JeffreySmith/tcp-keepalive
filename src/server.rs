@@ -7,6 +7,7 @@ use std::io::IoSliceMut;
 use std::os::fd::RawFd;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
@@ -14,7 +15,6 @@ use tokio::signal;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
-use std::sync::atomic::{AtomicUsize, Ordering};
 pub struct Server {
     id: u32,
     tcp_listener: TcpListener,
@@ -29,7 +29,7 @@ impl Server {
     pub fn new(
         id: u32,
         tcp_address: &str,
-        _unix_socket_path: String,
+        unix_socket_path: String,
         handoff_target: Option<String>,
     ) -> Result<Self> {
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
@@ -46,8 +46,12 @@ impl Server {
             println!("[Server {id}] Will hand off connections to {target} on shutdown")
         }
 
-        let unix_socket_path = format!("/tmp/tcp-server_{}_{}.sock", address.port(), id);
-        
+        let unix_socket_path = format!(
+            "{unix_socket_path}/socket-forward_{}_{}.sock",
+            address.port(),
+            id
+        );
+
         Ok(Server {
             id,
             tcp_listener,
@@ -66,7 +70,7 @@ impl Server {
                 eprintln!("[Server {}] Unix socket error: {}", server_clone.id, e);
             }
         });
-        
+
         let server_clone = Arc::clone(&self);
         tokio::spawn(async move {
             server_clone.wait_for_shutdown().await;
@@ -79,10 +83,10 @@ impl Server {
                     match result {
                         Ok((tcp_stream, _)) => {
                             println!("[Server {}] New client connection from {:?}", self.id, tcp_stream.peer_addr());
-                            let id = self.id;
+                            let id = self.id.clone();
                             let connections = Arc::clone(&self.active_connections);
                             let shutdown_token = self.shutdown_token.child_token();
-                            
+
                             let conn_id = {
                                 let mut id = self.next_connection_id.write().await;
                                 let current = *id;
@@ -136,8 +140,8 @@ impl Server {
             .ok()
             .and_then(|a| a.port().into())
             .unwrap_or(0);
-        let pattern = format!("tcp-server_{}_", tcp_port);
-        let my_socket = format!("tcp-server_{tcp_port}_{}.sock", self.id);
+        let pattern = format!("socket-forward_{}_", tcp_port);
+        let my_socket = format!("socket-forward_{tcp_port}_{}.sock", self.id);
 
         let mut peers = Vec::new();
 
@@ -177,9 +181,10 @@ impl Server {
                     let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
                     std_stream.set_nonblocking(true)?;
                     let tcp_stream = TcpStream::from_std(std_stream)?;
-                    return Ok::<(TcpStream, std::os::unix::net::UnixStream, RawFd), color_eyre::eyre::Error>(
-                        (tcp_stream, std_unix_stream, fd)
-                    );
+                    return Ok::<
+                        (TcpStream, std::os::unix::net::UnixStream, RawFd),
+                        color_eyre::eyre::Error,
+                    >((tcp_stream, std_unix_stream, fd));
                 }
             }
             Err(eyre!("No file descriptor received in control message"))
@@ -194,8 +199,12 @@ impl Server {
         println!("Sending ACK for FD {}", received_fd);
         unix_stream.write_all(b"ACK").await?;
 
-        println!("FD {} fully received and ACK sent, peer={:?}", received_fd, tcp_stream.peer_addr());
- 
+        println!(
+            "FD {} fully received and ACK sent, peer={:?}",
+            received_fd,
+            tcp_stream.peer_addr()
+        );
+
         Ok(tcp_stream)
     }
 
@@ -207,7 +216,7 @@ impl Server {
             println!("[Server {}] No active connections to hand off", self.id);
             return;
         }
-        
+
         let peers = self.discover_peers();
 
         if peers.is_empty() {
@@ -221,7 +230,7 @@ impl Server {
         }
 
         println!("[Server {}] Handing off {} connection(s)", self.id, count);
-        
+
         let mut peer_idx = 0;
         let mut handed_off = Vec::new();
 
@@ -230,12 +239,17 @@ impl Server {
                 let fd = stream.as_raw_fd();
                 let target = &peers[peer_idx % peers.len()];
 
-                println!("[Server {}] Conn {} (FD={}, peer={}) → {}", 
-                    self.id, conn_id, fd, peer_addr, target);
- 
+                println!(
+                    "[Server {}] Conn {} (FD={}, peer={}) → {}",
+                    self.id, conn_id, fd, peer_addr, target
+                );
+
                 match Self::handoff_connection_internal(stream, target).await {
                     Ok(_) => {
-                        println!("[Server {}] ACK received for conn {} (FD={})", self.id, conn_id, fd);
+                        println!(
+                            "[Server {}] ACK received for conn {} (FD={})",
+                            self.id, conn_id, fd
+                        );
                         handed_off.push(*conn_id);
                         peer_idx += 1;
                         sleep(Duration::from_millis(200)).await;
@@ -247,11 +261,18 @@ impl Server {
             }
         }
 
-        println!("[Server {}] 🗑️  Forgetting {} stream(s)", self.id, handed_off.len());
+        println!(
+            "[Server {}] 🗑️  Forgetting {} stream(s)",
+            self.id,
+            handed_off.len()
+        );
         for conn_id in handed_off {
             if let Some(stream) = connections.remove(&conn_id) {
                 let fd = stream.as_raw_fd();
-                println!("[Server {}] 🔓 Forgetting FD {} (conn {})", self.id, fd, conn_id);
+                println!(
+                    "[Server {}] 🔓 Forgetting FD {} (conn {})",
+                    self.id, fd, conn_id
+                );
                 std::mem::forget(stream);
                 println!("[Server {}] FD {} forgotten", self.id, fd);
             }
@@ -259,6 +280,7 @@ impl Server {
 
         drop(connections);
         println!("[Server {}] Handoff complete!", self.id);
+        std::fs::remove_file(&self.unix_socket_path).ok();
     }
 
     async fn handoff_connection_internal(
@@ -296,7 +318,7 @@ impl Server {
 
         Ok(())
     }
-    
+
     async fn handle_client(
         id: u32,
         conn_id: u64,
@@ -307,7 +329,7 @@ impl Server {
     ) {
         println!("[Server {}] Handler {} started", id, conn_id);
         active_connections_count.fetch_add(1, Ordering::SeqCst);
-        
+
         loop {
             tokio::select! {
                 _ = shutdown_token.cancelled() => {
@@ -363,8 +385,11 @@ impl Server {
         let std_listener: std::os::unix::net::UnixListener = unix_socket.into();
         let listener = UnixListener::from_std(std_listener)?;
 
-        println!("[Server {}] Unix socket listening on {}", self.id, self.unix_socket_path);
-        
+        println!(
+            "[Server {}] Unix socket listening on {}",
+            self.id, self.unix_socket_path
+        );
+
         loop {
             let cancel_token = self.shutdown_token.clone();
             let value = self.active_connections_count.clone();
@@ -376,10 +401,10 @@ impl Server {
                             match Self::receive_tcp_connection(unix_stream).await {
                                 Ok(tcp_stream) => {
                                     println!("[Server {}] Hand-off successful!", self.id);
-                                    let id = self.id;
+                                    let id = self.id.clone();
                                     let connections = Arc::clone(&self.active_connections);
                                     let shutdown_token = self.shutdown_token.child_token();
-                                    
+
                                     let conn_id = {
                                         let mut id = self.next_connection_id.write().await;
                                         let current = *id;
@@ -409,7 +434,7 @@ impl Server {
         }
         Ok(())
     }
-    
+
     async fn wait_for_shutdown(&self) {
         let ctrl_c = async {
             signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
@@ -430,7 +455,7 @@ impl Server {
                 println!("[Server {}] Received SIGTERM", self.id);
             }
         }
-        
+
         println!("[Server {}] Cancelling all handlers", self.id);
         self.shutdown_token.cancel();
     }

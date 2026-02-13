@@ -10,3 +10,4 @@ color-eyre = "0.6.5"
 tokio-util = { version = "0.7.18", features = ["full", "rt"] }
 chrono = "0.4.43"
 nix = { version = "0.31.1", features = ["uio", "socket"] }
+clap = { version = "4.5.58", features = ["derive", "env", "string"] }

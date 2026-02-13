@@ -2,56 +2,94 @@ mod client;
 mod server;
 
 use color_eyre::Result;
-use std::sync::Arc;
-use tokio;
+use std::{collections::HashSet, sync::Arc};
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    Server {
+        /// Use this to override the server id. By default, this will be generated for you
+        #[arg(short, long)]
+        id: Option<u32>,
+        /// The folder where the socket files will be created. Default is /tmp
+        /// One unix socket will be created per server
+        #[arg(short, long, default_value = "/tmp")]
+        unix_socket_folder: String,
+        /// The port to listen on
+        #[arg(short, long, default_value_t = 3000)]
+        port: u16,
+        #[arg(short, long, default_value = "127.0.0.1")]
+        tcp_address: String,
+    },
+    Client {
+        /// The server address to connect to (eg 127.0.0.1:3000)
+        #[arg(short, long)]
+        tcp_address: String,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let args = Args::parse();
 
-    if args.len() < 2 {
-        eprintln!("Usage: {} [server|client]", args[0]);
-        std::process::exit(1);
-    }
-    match args[1].as_str() {
-        "server" => {
-            if args.len() < 5 {
-                eprintln!(
-                    "Usage: {} server <id> <tcp_address> <unix_socket_path>",
-                    args[0]
-                );
-                std::process::exit(1);
-            }
-            let server_id: u32 = args[2].parse()?;
-            let tcp_port: u16 = args[3].parse()?;
-            let unix_socket = args[4].clone();
-            let tcp_addr = format!("127.0.0.1:{tcp_port}");
-            let handoff_target = args.get(5).cloned();
-            println!("Starting Server {server_id} on {tcp_addr}");
-            println!("Unix socket: {}", unix_socket);
-
+    match args.command {
+        Commands::Server {
+            id,
+            tcp_address,
+            unix_socket_folder,
+            port,
+        } => {
+            let server_id = if let Some(i) = id {
+                i
+            } else {
+                find_available_server_id(&unix_socket_folder, port)?
+            };
+            let tcp_addr = format!("{tcp_address}:{port}");
             let server = Arc::new(server::Server::new(
                 server_id,
                 &tcp_addr,
-                unix_socket,
-                handoff_target,
+                unix_socket_folder,
+                None,
             )?);
             server.run().await?;
         }
-        "client" => {
-            if args.len() < 3 {
-                eprintln!("Usage: {} client <tcp_addr>", args[0]);
-                std::process::exit(1);
-            }
-            let server_addr = args[2].clone();
-            let client = client::Client::new(server_addr);
+        Commands::Client { tcp_address } => {
+            let client = client::Client::new(tcp_address);
             client.run().await?;
-        }
-        _ => {
-            eprintln!("Unknown mode: {}", args[1]);
-            std::process::exit(1);
         }
     }
 
     Ok(())
+}
+
+fn find_available_server_id(socket_folder: &str, port: u16) -> Result<u32> {
+    let pattern = format!("socket-forward_{}_", port);
+    let mut used_ids = HashSet::new();
+
+    if let Ok(entries) = std::fs::read_dir(socket_folder) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().into_string().unwrap_or_default();
+            if file_name.starts_with(&pattern)
+                && let Some(id_str) = file_name
+                    .strip_prefix(&pattern)
+                    .and_then(|s| s.split('.').next())
+                && let Ok(id) = id_str.parse::<u32>()
+            {
+                used_ids.insert(id);
+            }
+        }
+    }
+    let mut available_id = 1;
+    while used_ids.contains(&available_id) {
+        available_id += 1;
+    }
+    Ok(available_id)
 }
